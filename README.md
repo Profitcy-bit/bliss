@@ -1,152 +1,124 @@
-# Bliss — a trading research system engineered so it cannot lie to its operator
+# Bliss
 
-**Built by one person and Claude, in public view of its own failures.**
+**A systematic trading-research platform engineered so it cannot lie to its operator.**
+Built end-to-end by one operator directing Claude (research → implementation → operations).
+The working strategy code is private; this repository is the complete technical
+documentation of the architecture, evaluation methodology, and operational design.
 
-Bliss is an options-intelligence platform and autonomous paper-trading agent:
-it reads market structure, grades trade setups Prime / Valid / Watch / Avoid,
-executes the best of them against a broker (Interactive Brokers, paper), and
-keeps an append-only journal of everything that happens. The working system —
-grading engine, backtest harness, multi-horizon scanner, execution daemon,
-API, and website — lives in a private repository.
-
-This public repo documents the part that matters to anyone outside the
-strategy: **the honesty architecture.** Bliss is designed around one governing
-question — *how do you build a self-evaluating system that cannot flatter
-itself?* — which turns out to be an alignment question wearing a finance
-costume.
+> Current honest status (July 2026): paper-trading a $1,000 forward test through
+> Interactive Brokers. Measured edge under execution-faithful evaluation: **zero** —
+> reported plainly, because producing that number honestly is the system's core feature.
 
 ---
 
-## The problem: evaluation pipelines want to lie
+## What it is
 
-Any system that grades its own ideas and reports its own performance sits on
-a gradient toward self-flattery. In trading research the canonical failures
-are lookahead (the model peeks at the future), survivorship and selection
-bias, overfit backtests, and — subtlest of all — **evaluation assumptions
-that quietly favor the system**. Nobody writes `flatter_me=True`; it arrives
-disguised as a reasonable default.
+Bliss is three cooperating systems:
 
-Bliss treats these as structural problems, not discipline problems. The rules
-are enforced by code and tests, never by intention.
+1. **The Brain** — market-structure analysis (swing/BOS/CHoCH detection, supply–demand
+   zones, fair-value gaps, liquidity sweeps, volatility diagnostics) fused by a
+   transparent rules engine into graded trade theses: `Prime / Valid / Watch / Avoid`,
+   each with entry/stop/target geometry, contract fit, and plain-English
+   why / confirms / invalidates.
+2. **The Ruler** — a point-in-time evaluation stack that decides what is true:
+   no-lookahead replay, an execution-faithful fill model, per-grade calibration,
+   and overfitting surveillance. Nothing influences a grade until it wins here.
+   See [EVALUATION.md](docs/EVALUATION.md).
+3. **The Agent** — an autonomous execution layer (currently paper) with hard risk
+   rails: fixed-fractional sizing, a global daily kill switch, correlation netting,
+   account-regulation awareness (PDT budgets, settled-funds ledgers), and an
+   append-only journal as the single source of record.
+   See [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [OPERATIONS.md](docs/OPERATIONS.md).
 
-## The honesty architecture
+```mermaid
+flowchart LR
+    subgraph DATA[Data Layer]
+      IBKR[IBKR Gateway adapter]
+      POLY[Polygon adapter]
+      FB[Deterministic fallback]
+    end
+    subgraph BRAIN[Analysis and Grading]
+      SMC[Structure engine]
+      VOLDX[Volatility diagnostics]
+      GRADE[Rules-based grader]
+    end
+    subgraph RULER[Evaluation]
+      REPLAY[Point-in-time replay]
+      FILL[Honest fill model]
+      CAL[Calibration + rigor stats]
+    end
+    subgraph AGENT[Execution]
+      SCAN[Multi-horizon scanner]
+      EXEC[Broker execution]
+      MON[Position monitor]
+      JRNL[(Append-only journal)]
+    end
+    DATA --> BRAIN --> AGENT
+    BRAIN --> RULER
+    JRNL --> RULER
+    RULER -- gates --> BRAIN
+    SCAN --> EXEC --> MON --> JRNL
+```
 
-- **The cardinal no-lookahead rule.** At bar *i*, every read is computed from
-  bars `[:i+1]` only. This is pinned by tests: appending future bars to a
-  series must not change any earlier read.
-- **Point-in-time replay as the single ruler.** Every idea is graded by the
-  same harness: walk history, grade each moment blind, follow each setup
-  forward to a labeled outcome, calibrate per grade (win rates with Wilson
-  intervals, Brier score, expected calibration error), and test the ladder's
-  monotonicity (Prime must actually beat Avoid).
-- **Grade-before-hardcode.** Every candidate signal ships default-OFF and
-  byte-identical to baseline when off. It earns influence only by winning an
-  A/B on the ruler, across symbols and regimes. Rejections are recorded and
-  kept. The system's own liquidity gate was graded NO-GO twice and remains
-  off — the process working as designed.
-- **No gate may rescue an Avoid.** Confluence can promote good setups; nothing
-  may promote one the base rules called untradable.
-- **Real data or no data.** `require_real_data` gates the record: synthetic
-  or fallback data can exercise the plumbing but can never enter the journal,
-  the hit rate, or any reported number.
-- **Cancels are not trades.** An entry that never filled is excluded from the
-  hit rate — crediting phantom fills once produced a fake 100% win rate in
-  early development, and the fix became a permanent rule.
-- **Overfit surveillance.** Probabilistic and Deflated Sharpe Ratio and
-  Probability of Backtest Overfitting are first-class outputs, so "we found
-  an edge" always travels with "and here is the probability we fooled
-  ourselves."
+## Stack
 
-## Case study: the phantom-fill subsidy
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.12, FastAPI, `ib_async` (single-worker executor, hard timeouts, self-healing reconnect) |
+| Analysis / backtest | Pure-Python, dependency-light modules; property-based no-lookahead tests |
+| ML | Deterministic logistic meta-labeler (calibration-first); gradient-boosted models deferred until data depth earns them |
+| Frontend | Next.js, canvas-drawn chart primitives (zones, FVGs, BOS/CHoCH markers, R/R bands) |
+| Persistence | Append-only JSONL journal (trades), SQLite (UI state), filesystem reports |
+| Ops | Three `launchd` services (agent daemon, API, web), scheduled readiness/report tasks, notification sentinel |
+| Test suite | 230 pytest tests; suite-green is a hard commit gate |
 
-For months, the harness labeled setups under a standard, innocent-looking
-assumption: *the planned entry always fills.* In July 2026 we replaced it
-with an honest fill model that mirrors live execution exactly — an entry is
-pending until price actually trades through it; a target struck while the
-order is still pending cancels the trade (it never existed); a bar that fills
-and stops you in the same breath is a loss.
+## Engineering principles (the ones that cost something)
 
-Measured on real broker data, the results were uncomfortable and immediately
-adopted:
+- **No-lookahead as a tested property, not a convention.** At bar *i* every read sees
+  `candles[:i+1]` only; tests assert that appending future bars cannot change an
+  earlier read.
+- **Default-OFF candidates.** Every new signal ships behind a flag, byte-identical to
+  baseline when off, and earns influence only through an A/B on the fixed ruler.
+  Rejections are retained as first-class results.
+- **Execution-faithful evaluation.** Outcomes count only if the entry actually trades;
+  the fill model mirrors live pending-order semantics exactly. Replacing the naive
+  fills-always assumption erased a +0.65R/attempt bias from every prior baseline —
+  the defining case study of this project ([EVALUATION.md §5](docs/EVALUATION.md)).
+- **Trust is rented.** The ML layer's sizing authority scales only with verified
+  out-of-sample reliability per confidence bucket (Wilson lower bound) and revokes
+  automatically on decay.
+- **Live trading is disabled in code, not configuration.** The live broker constructor
+  raises unconditionally; enabling it is a reviewed code change behind a rigor bar
+  and explicit per-market sign-off.
+- **The journal is sacred.** Append-only, real data only, cancels excluded from hit
+  rate, every reported number reproducible from it.
 
-| metric (Prime setups, honest fills) | assumed fills | honest fills |
-|---|---|---|
-| fill rate | 100% (by assumption) | ~30% |
-| expectancy per attempt | +0.65R | ≈ 0.00R (statistically zero) |
-| dominant cancel reason | — | price ran to target without filling (~67%) |
+## Build process
 
-The evaluation assumption had been subsidizing every baseline by roughly
-+0.65R per attempt. No parameter had been overfit; no rule had been broken.
-The *measurement itself* had been optimistic, which is the failure mode that
-matters: it rewards exactly the strategies that exploit it (deep pullback
-entries that look brilliant when fills are free and rarely fill in reality).
+Bliss was built in weeks by one non-professional developer directing Claude across
+three surfaces: research chats producing 20 primary-source dossiers; Claude Code
+implementing staged specifications (implement → test → grade → verdict → stop for
+human review, one stage per commit); and a Cowork session operating services,
+schedules, and verification on the host machine. A single handoff document
+(`SESSION_STATE.md`) makes any fresh session fully operational in one read.
+Stacked draft PRs, conventional commits, secrets and records gitignored.
 
-The system's response, in order: record the number, re-baseline everything on
-the honest ruler, mark the machine-learning layer's earlier passing grade as
-suspect pending re-evaluation on honest labels, and redirect the roadmap from
-"add signals" to "fix entries." The same investigation surfaced a silent data
-bug — intraday requests falling back to daily bars — caught precisely because
-no component is a black box, and pinned by a full-coverage test the same
-night.
+## Repository map
 
-## The learning layer: trust is rented, never owned
+| Document | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layers, data flow, module responsibilities, fleet design (multi-market agents over one risk core) |
+| [docs/EVALUATION.md](docs/EVALUATION.md) | The ruler: replay, fill-model semantics, calibration, rigor statistics, A/B protocol, phantom-fill postmortem |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Services, scheduling, notifications, risk rails, account-law compliance, live-enable protocol |
 
-Bliss's ML component is deliberately boring: a transparent meta-labeler that
-learns p(win) per setup from harness outcomes, evaluated on calibration (does
-"70%" win 70% of the time?) rather than accuracy theater. Its designed role
-in sizing is a **conviction ladder**: position size may scale up only with
-the *realized, out-of-sample* hit rate of the model's confidence bucket —
-keyed to the Wilson lower bound, capped, and wrapped in automatic
-self-distrust: if a bucket's live reliability decays below its band, the
-ladder collapses to base size fleet-wide and each tier must re-earn
-activation. Authority is granted by verified track record and revoked by the
-same mechanism, without appeal.
+## What is deliberately not here
 
-## Guardrails against everyone — including the operator
+Strategy parameters, grading thresholds, the research dossiers, entry/exit candidate
+specifics, and all trading records. The methodology is shareable; the edge under
+construction is not.
 
-Live trading is not disabled by configuration; it is disabled *in code* — the
-live broker constructor raises. Enabling it is a deliberate code change
-gated on a rigor bar (calibrated, non-overfit, positive expectancy on the
-honest ruler) plus explicit human sign-off, per market. Below that sit a
-fleet-wide daily kill switch, per-trade risk caps, a correlation rule that
-counts correlated positions as one, and account-law awareness (pattern-day-
-trading budgets, settled-funds ledgers) so the paper record can never
-outperform what is legally replicable live.
+---
 
-## How it was built: a human-AI collaboration protocol
-
-Bliss is a working case study in delegated agency. One non-professional
-developer directs; Claude instances build, measure, and challenge:
-
-- **Specs as prompts.** Features arrive as staged, testable scripts with
-  non-negotiables at the top; an agent session implements one stage, runs the
-  ruler, prints a verdict, and stops for human review.
-- **Shared memory.** A single `SESSION_STATE.md` handoff document makes any
-  fresh session fully operational in one read and is updated whenever
-  operational reality changes.
-- **The AI as skeptic, not cheerleader.** The measurement layer exists partly
-  to referee the humans: when "make every trade fill" was proposed, the
-  harness had already priced that wish — guaranteed fills lost more to chasing
-  than misses cost — and the design conversation moved from philosophy to
-  arithmetic.
-
-## Why this might interest AI-safety-minded readers
-
-Bliss is small, but it is an end-to-end exercise in problems safety research
-cares about: specification gaming by evaluation pipelines (the phantom-fill
-subsidy is reward hacking's quiet cousin), honest reporting under incentive
-to look good, calibrated confidence as a condition for delegated authority,
-trust mechanisms with automatic revocation, and hard action-space guardrails
-around an increasingly autonomous agent. None of it is claimed as novel
-research — it is practiced engineering against those failure modes, with
-receipts.
-
-## Status and honesty note
-
-As of July 2026: paper trading a $1,000 forward test through Interactive
-Brokers; measured edge under honest fills is currently **zero** — stated
-plainly because that is the point of the system. The strategy layer,
-research dossiers, and edge work remain private.
-
-*Bliss is a research project. Nothing here is financial advice, and no
-returns are promised or implied.*
+*Bliss is a research project. Nothing here is financial advice; no returns are
+promised or implied. Documentation © 2026 Cedric Lewis II — shared for review;
+all rights reserved.*
